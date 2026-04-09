@@ -1,0 +1,60 @@
+---
+name: rema
+description: Use when executing commands, training, or checking GPU status on remote machines via shared mount. Remote machine must be registered with `rema start` beforehand. Source: https://github.com/Disapole-Xiao/ReMA | Local: /workspace/images-ks3-hd/workspace/xiaozihan/code/rema
+---
+
+# ReMA — Remote Machine Access
+
+Execute commands across machines through a shared mount. All machines must mount the same data volume.
+
+## Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `rema start <name>` | Start worker in current directory |
+| `rema stop <name>` | Stop worker |
+| `rema status <name>` | idle / busy / off |
+| `rema run <name> -- <cmd>` | Sync: real-time output, wait for completion |
+| `rema run <name> --async -- <cmd>` | Async: submit and return immediately |
+| `rema log <name>` | Show latest job output |
+| `rema list` | Show all machines and status |
+
+## Usage
+
+Before running commands, the remote machine must be registered:
+```bash
+# On remote machine, in the desired working directory:
+rema start <name>
+```
+
+Then from any machine:
+```bash
+# Check status
+rema status <name>
+
+# Run command (sync, real-time output)
+rema run <name> -- nvidia-smi
+rema run <name> -- "cd project && python train.py"
+
+# Run command (async, returns immediately)
+rema run <name> --async -- "sleep 10 && python train.py"
+
+# Check output of async job
+rema log <name>
+```
+
+## Key Behaviors
+
+- Commands execute in the directory where `rema start` was run
+- Status may show `off` briefly after sync — shared mount latency is normal
+- `rema list` checks all registered machines; `off` means worker is not running or heartbeat expired
+- Each job gets a unique ID; use `rema log <name> <job_id>` for specific jobs
+
+## Environment
+
+Set via `~/.rema_config` or environment variable:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REMA_DIR` | required | Shared directory path |
+| `REMA_LOG_KEEP_DAYS` | `7` | Auto-delete old logs |

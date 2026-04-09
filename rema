@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# ReMA — Remote Machine Access
+# Execute commands across machines through a shared mount.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# Load config if exists
+[ -f "$HOME/.rema_config" ] && . "$HOME/.rema_config"
+
+REMA_DIR="${REMA_DIR:-}"
+REMA_LOG_KEEP_DAYS="${REMA_LOG_KEEP_DAYS:-7}"
+REMA_HEARTBEAT_INTERVAL=10
+REMA_STATUS_TIMEOUT=60
+REMA_OUTPUT_POLL_INTERVAL=1
+REMA_OUTPUT_LOG_WAIT=30
+
+# Work directory for commands: parent directory of REMA_DIR
+REMA_WORKDIR="$(dirname "$REMA_DIR")"
+
+#--- Utility functions ---
+
+die() { echo "rema: $*" >&2; exit 1; }
+
+# Generate unique job_id: timestamp_pid_random
+gen_job_id() {
+  printf "%s_%s_%s" "$(date +%s%3N)" "$$" "$RANDOM"
+}
+
+# Check REMA_DIR is set
+check_dir() {
+  [ -z "$REMA_DIR" ] && die "REMA_DIR not set. Run install.sh or export REMA_DIR manually."
+  mkdir -p "$REMA_DIR"
+}
+
+# Get machine directory path
+machine_dir() { echo "$REMA_DIR/$1"; }
+
+# Read a KEY=VALUE field from cmd file
+read_cmd_field() {
+  local file="$1" key="$2"
+  grep "^${key}=" "$file" 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+# Read heartbeat age in seconds
+heartbeat_age() {
+  local heartbeat_file="$1"
+  local ts
+  ts=$(cat "$heartbeat_file" 2>/dev/null) || { echo 999; return; }
+  echo $(( $(date +%s) - ts ))
+}
+
+# Get machine status: off / idle / busy
+get_status() {
+  local dir="$1"
+  local age
+
+  # Check heartbeat freshness
+  if [ -f "$dir/heartbeat" ]; then
+    age=$(heartbeat_age "$dir/heartbeat")
+    if [ "$age" -gt "$REMA_STATUS_TIMEOUT" ]; then
+      echo "off"; return
+    fi
+  else
+    echo "off"; return
+  fi
+
+  # Read status file
+  local status
+  status=$(cat "$dir/status" 2>/dev/null) || status="off"
+  echo "$status"
+}
+
+# Update heartbeat file
+update_heartbeat() {
+  local dir="$1"
+  echo "$(date +%s)" > "$dir/heartbeat"
+}
+
+# Clean old logs
+clean_old_logs() {
+  local dir="$1"
+  find "$dir/output/" -name "*.log" -mtime +${REMA_LOG_KEEP_DAYS} -delete 2>/dev/null || true
+}
+
+#--- Worker loop (internal) ---
+
+_worker_loop() {
+  local name="$1"
+  local dir
+  dir=$(machine_dir "$name")
+
+  local cmd_file="$dir/cmd"
+  local last_job_id=""
+  local last_mtime=0
+  local last_size=0
+
+  mkdir -p "$dir/output"
+  # Read work directory from start-time config, fallback to REMA_WORKDIR
+  local workdir="$REMA_WORKDIR"
+  [ -f "$dir/workdir" ] && workdir=$(cat "$dir/workdir")
+  cd "$workdir"
+
+  while true; do
+    # Update heartbeat
+    update_heartbeat "$dir"
+
+    # Change detection: compare mtime and size
+    if [ -f "$cmd_file" ]; then
+      local curr_mtime curr_size
+      curr_mtime=$(stat -c%Y "$cmd_file" 2>/dev/null || echo 0)
+      curr_size=$(stat -c%s "$cmd_file" 2>/dev/null || echo 0)
+
+      if [ "$curr_mtime" != "$last_mtime" ] || [ "$curr_size" != "$last_size" ]; then
+        last_mtime="$curr_mtime"
+        last_size="$curr_size"
+
+        local job_id command
+        job_id=$(read_cmd_field "$cmd_file" "JOB_ID")
+        command=$(read_cmd_field "$cmd_file" "COMMAND")
+
+        if [ -n "$job_id" ] && [ "$job_id" != "$last_job_id" ]; then
+          last_job_id="$job_id"
+
+          # Clean old logs before executing
+          clean_old_logs "$dir"
+
+          # Execute
+          echo "busy" > "$dir/status"
+          local logfile="$dir/output/${job_id}.log"
+
+          {
+            echo "=== rema job: $job_id ==="
+            echo "=== command: $command ==="
+            echo "=== started: $(date '+%Y-%m-%d %H:%M:%S') ==="
+            echo ""
+          } > "$logfile"
+
+          bash -c "$command" >> "$logfile" 2>&1
+          local exit_code
+          exit_code=$?
+
+          {
+            echo ""
+            echo "=== ended: $(date '+%Y-%m-%d %H:%M:%S') ==="
+            echo "REMA_DONE:${exit_code}"
+          } >> "$logfile"
+
+          echo "idle" > "$dir/status"
+        fi
+      fi
+    fi
+
+    sleep "$REMA_HEARTBEAT_INTERVAL"
+  done
+}
+
+#--- Commands ---
+
+cmd_start() {
+  local name="${1:-}"
+  [ -z "$name" ] && die "usage: rema start <name>"
+
+  check_dir
+  local dir
+  dir=$(machine_dir "$name")
+  mkdir -p "$dir/output"
+
+  # Check if already running
+  if [ -f "$dir/pid" ]; then
+    local old_pid
+    old_pid=$(cat "$dir/pid")
+    if kill -0 "$old_pid" 2>/dev/null; then
+      die "worker '$name' is already running (pid: $old_pid)"
+    fi
+    rm -f "$dir/pid"
+  fi
+
+  # Start worker in background: source this script and call _worker_loop
+  nohup bash "$0" _worker "$name" </dev/null >> "$dir/output/worker.log" 2>&1 &
+  local worker_pid
+  worker_pid=$!
+
+  echo "$worker_pid" > "$dir/pid"
+  echo "idle" > "$dir/status"
+  echo "$PWD" > "$dir/workdir"
+  update_heartbeat "$dir"
+  echo "rema: worker '$name' started (pid: $worker_pid)"
+  echo "rema: work directory: $PWD"
+}
+
+cmd_status() {
+  local name="${1:-}"
+  [ -z "$name" ] && die "usage: rema status <name>"
+
+  check_dir
+  local dir
+  dir=$(machine_dir "$name")
+
+  [ ! -d "$dir" ] && die "machine '$name' not found"
+
+  local status
+  status=$(get_status "$dir")
+
+  echo "$status"
+}
+
+cmd_run() {
+  local name="" async_mode=false cmd_parts="" found_dashes=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --async) async_mode=true; shift ;;
+      --) shift; cmd_parts="$*"; found_dashes=true; break ;;
+      -*) die "unknown option: $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+
+  [ -z "$name" ] && die "usage: rema run <name> [--async] -- <command>"
+  [ -z "$cmd_parts" ] && die "usage: rema run <name> [--async] -- <command>"
+
+  check_dir
+  local dir
+  dir=$(machine_dir "$name")
+
+  [ ! -d "$dir" ] && die "machine '$name' not found"
+
+  # Check worker status
+  local status
+  status=$(get_status "$dir")
+  [ "$status" = "off" ] && die "worker '$name' is not running (status: off)"
+
+  # Generate job_id and write cmd file
+  local job_id
+  job_id=$(gen_job_id)
+
+  {
+    echo "JOB_ID=${job_id}"
+    echo "COMMAND=${cmd_parts}"
+    echo "TIMESTAMP=$(date +%s)"
+  } > "$dir/cmd"
+
+  if $async_mode; then
+    echo "rema: job submitted (job_id: $job_id)"
+    return 0
+  fi
+
+  # Sync mode: wait for log file to appear
+  local logfile="$dir/output/${job_id}.log"
+  local waited=0
+  while [ ! -f "$logfile" ]; do
+    sleep "$REMA_OUTPUT_POLL_INTERVAL"
+    waited=$((waited + 1))
+    if [ "$waited" -ge "$REMA_OUTPUT_LOG_WAIT" ]; then
+      die "timeout waiting for worker '$name' to pick up job (job_id: $job_id)"
+    fi
+  done
+
+  # Follow output
+  local lines_read=0
+  while true; do
+    local total
+    total=$(wc -l < "$logfile" 2>/dev/null) || total=0
+    if [ "$total" -gt "$lines_read" ]; then
+      tail -n +"$((lines_read + 1))" "$logfile"
+      lines_read=$total
+    fi
+    if grep -q "^REMA_DONE:" "$logfile" 2>/dev/null; then
+      local exit_code
+      exit_code=$(grep "^REMA_DONE:" "$logfile" | tail -1 | cut -d: -f2-)
+      echo ""
+      echo "--- rema: job completed, exit code: $exit_code ---"
+      return "$exit_code"
+    fi
+    sleep "$REMA_OUTPUT_POLL_INTERVAL"
+  done
+}
+
+cmd_log() {
+  local name="${1:-}" job_id="${2:-}"
+  [ -z "$name" ] && die "usage: rema log <name> [job_id]"
+
+  check_dir
+  local dir
+  dir=$(machine_dir "$name")
+
+  [ ! -d "$dir" ] && die "machine '$name' not found"
+
+  local logfile
+  if [ -n "$job_id" ]; then
+    logfile="$dir/output/${job_id}.log"
+    [ ! -f "$logfile" ] && die "log not found: $job_id"
+  else
+    logfile=$(ls -t "$dir/output/"*.log 2>/dev/null | head -1)
+    [ -z "$logfile" ] && die "no logs found for '$name'"
+  fi
+
+  cat "$logfile"
+}
+
+cmd_stop() {
+  local name="${1:-}"
+  [ -z "$name" ] && die "usage: rema stop <name>"
+
+  check_dir
+  local dir
+  dir=$(machine_dir "$name")
+
+  [ ! -d "$dir" ] && die "machine '$name' not found"
+
+  if [ ! -f "$dir/pid" ]; then
+    die "no worker running for '$name' (no pid file)"
+  fi
+
+  local pid
+  pid=$(cat "$dir/pid")
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "rema: worker '$name' is not running (stale pid file cleaned)"
+    rm -f "$dir/pid"
+    echo "off" > "$dir/status"
+    return 0
+  fi
+
+  kill "$pid" 2>/dev/null
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if [ "$waited" -ge 5 ]; then
+      kill -9 "$pid" 2>/dev/null
+      break
+    fi
+  done
+
+  rm -f "$dir/pid"
+  echo "off" > "$dir/status"
+  echo "rema: worker '$name' stopped"
+}
+
+cmd_list() {
+  check_dir
+
+  local first=true
+  for dir in "$REMA_DIR"/*/; do
+    [ -d "$dir" ] || continue
+    local name
+    name=$(basename "$dir")
+
+    $first && { printf "%-20s %-10s %s\n" "NAME" "STATUS" "HEARTBEAT"; first=false; }
+
+    local status age_text="-"
+    status=$(get_status "$dir")
+
+    if [ -f "$dir/heartbeat" ]; then
+      local age
+      age=$(heartbeat_age "$dir/heartbeat")
+      if [ "$age" -lt 60 ]; then
+        age_text="${age}s ago"
+      elif [ "$age" -lt 3600 ]; then
+        age_text="$((age / 60))m ago"
+      else
+        age_text="$((age / 3600))h ago"
+      fi
+    fi
+
+    printf "%-20s %-10s %s\n" "$name" "$status" "$age_text"
+  done
+
+  if $first; then
+    echo "no machines found"
+  fi
+}
+
+#--- Main ---
+
+usage() {
+  cat <<'EOF'
+ReMA — Remote Machine Access
+
+Usage:
+  rema start <name>                Start worker on this machine
+  rema stop <name>                 Stop worker on this machine
+  rema status <name>               Check machine status
+  rema run <name> -- <command>     Execute command (sync, real-time output)
+  rema run <name> --async -- <command>  Execute command (async, immediate return)
+  rema log <name> [job_id]         Show job output
+  rema list                        List all machines and their status
+
+Options:
+  -h, --help       Show this help
+  -V, --version    Show version
+EOF
+}
+
+main() {
+  [ $# -eq 0 ] && { usage; exit 0; }
+
+  local cmd="$1"; shift
+
+  case "$cmd" in
+    start)    cmd_start "$@" ;;
+    stop)     cmd_stop "$@" ;;
+    status)   cmd_status "$@" ;;
+    run)      cmd_run "$@" ;;
+    log)      cmd_log "$@" ;;
+    list)     cmd_list "$@" ;;
+    -h|--help)    usage ;;
+    -V|--version) echo "rema $VERSION" ;;
+    *)            die "unknown command: $cmd (see 'rema --help')" ;;
+  esac
+}
+
+# If sourced as worker function, _worker_loop is available
+# In normal invocation, this calls main
+if [[ "${1:-}" == "_worker" ]]; then
+  shift
+  _worker_loop "$@"
+else
+  main "$@"
+fi
