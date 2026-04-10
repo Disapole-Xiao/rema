@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ReMA — Remote Machine Access
 # Execute commands across machines through a shared mount.
-set -euo pipefail
+set -uo pipefail
 
 VERSION="0.1.0"
 
@@ -95,6 +95,9 @@ _worker_loop() {
   local last_mtime=0
   local last_size=0
 
+  # Write crash info on exit
+  trap 'echo "worker crashed at $(date "+%Y-%m-%d %H:%M:%S"), exit code: $?" >> "$dir/output/worker.log"; echo "off" > "$dir/status"' EXIT
+
   mkdir -p "$dir/output"
   # Read work directory from start-time config, fallback to REMA_WORKDIR
   local workdir="$REMA_WORKDIR"
@@ -187,6 +190,7 @@ cmd_start() {
   update_heartbeat "$dir"
   echo "rema: worker '$name' started (pid: $worker_pid)"
   echo "rema: work directory: $PWD"
+  echo "rema: log: $dir/output/worker.log"
 }
 
 cmd_status() {
